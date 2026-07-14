@@ -7,6 +7,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/collect.yml"
 def test_workflow_uses_immutable_dated_releases():
     text = WORKFLOW.read_text()
 
+    assert "workflow_dispatch:" in text
     assert "gh release delete" not in text
     assert "refs/tags/latest" not in text
     assert "--prior-data-dir" not in text
