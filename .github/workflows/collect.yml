@@ -4,13 +4,9 @@ on:
   schedule:
     # Every Sunday at 06:00 UTC
     - cron: "0 6 * * 0"
-  workflow_dispatch:
-    inputs:
-      full_history:
-        description: "Force full re-download (ignore prior release)"
-        required: false
-        default: "false"
-        type: boolean
+
+permissions:
+  contents: read
 
 # Sharding strategy:
 #   15m — 4 shards (most API calls: ~260 windows/pair × 135 pairs)
@@ -28,10 +24,23 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+      snapshot_tag: ${{ steps.gen.outputs.snapshot_tag }}
+      collection_cutoff: ${{ steps.gen.outputs.collection_cutoff }}
+      base_snapshot: ${{ steps.gen.outputs.base_snapshot }}
     steps:
       - name: Generate shard matrix
         id: gen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          SNAPSHOT_TAG=$(date -u +%F)
+          COLLECTION_CUTOFF=$(date -u +%s)
+          if gh release view "$SNAPSHOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $SNAPSHOT_TAG already exists" >&2
+            exit 1
+          fi
+          BASE_SNAPSHOT=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,createdAt --jq '.[] | select(.tagName | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) | .tagName' | head -n 1)
+          export SNAPSHOT_TAG COLLECTION_CUTOFF BASE_SNAPSHOT
           python3 - <<'EOF'
           import json, os
           shard_map = json.loads(os.environ["SHARD_MAP"])
@@ -42,6 +51,9 @@ jobs:
           matrix = json.dumps({"include": items})
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={matrix}\n")
+              f.write(f"snapshot_tag={os.environ['SNAPSHOT_TAG']}\n")
+              f.write(f"collection_cutoff={os.environ['COLLECTION_CUTOFF']}\n")
+              f.write(f"base_snapshot={os.environ.get('BASE_SNAPSHOT', '')}\n")
           print(f"Matrix: {len(items)} jobs")
           EOF
 
@@ -67,35 +79,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Download prior release (incremental)
-        if: ${{ github.event.inputs.full_history != 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p prior_data
-          TF="${{ matrix.timeframe }}"
-          ASSET="apex-ohlcv-${TF}.zip"
-          gh release download latest --pattern "$ASSET" --dir /tmp/prior_zip \
-            --repo "${{ github.repository }}" 2>/dev/null || true
-          if [ -f "/tmp/prior_zip/$ASSET" ]; then
-            unzip -q "/tmp/prior_zip/$ASSET" -d prior_data/
-            echo "Loaded prior data for $TF"
-          else
-            echo "No prior release found — full download"
-          fi
-
       - name: Collect OHLCV
         run: |
-          PRIOR_ARG=""
-          if [ -d "prior_data" ] && [ "$(ls -A prior_data 2>/dev/null)" ]; then
-            PRIOR_ARG="--prior-data-dir prior_data"
-          fi
           python collector/collect_ohlcv.py \
             --timeframe ${{ matrix.timeframe }} \
             --shard ${{ matrix.shard }} \
             --total-shards ${{ matrix.total_shards }} \
             --out-dir data/ \
-            $PRIOR_ARG
+            --until ${{ needs.setup.outputs.collection_cutoff }}
 
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
@@ -108,7 +99,7 @@ jobs:
   # 3. Merge shards, generate manifest, publish release
   # -------------------------------------------------------------------------
   publish:
-    needs: ohlcv
+    needs: [setup, ohlcv]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,36 +122,65 @@ jobs:
           path: merged/
           merge-multiple: true
 
+      - name: Download baseline release
+        if: ${{ needs.setup.outputs.base_snapshot != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/baseline_zip baseline
+          for TF in 15m 1h 4h 1d; do
+            ASSET="apex-ohlcv-${TF}.zip"
+            gh release download "${{ needs.setup.outputs.base_snapshot }}" \
+              --pattern "$ASSET" \
+              --dir /tmp/baseline_zip \
+              --repo "${{ github.repository }}"
+            if [ ! -f "/tmp/baseline_zip/$ASSET" ]; then
+              echo "Missing baseline asset $ASSET" >&2
+              exit 1
+            fi
+            unzip -q "/tmp/baseline_zip/$ASSET" -d baseline/
+            rm -f "/tmp/baseline_zip/$ASSET"
+          done
+
+      - name: Validate snapshot coverage
+        run: |
+          BASE_SNAPSHOT="${{ needs.setup.outputs.base_snapshot }}"
+          if [ -n "$BASE_SNAPSHOT" ]; then
+            python collector/validate_snapshot.py --candidate-dir merged --baseline-dir baseline
+          else
+            python collector/validate_snapshot.py --candidate-dir merged
+          fi
+
       - name: Package per-timeframe zips
         run: |
           mkdir -p release_assets
+          shopt -s nullglob
           for TF in 15m 1h 4h 1d; do
-            zip -j release_assets/apex-ohlcv-${TF}.zip merged/*-${TF}-futures.feather 2>/dev/null || true
-            if [ -f release_assets/apex-ohlcv-${TF}.zip ]; then
-              COUNT=$(unzip -l release_assets/apex-ohlcv-${TF}.zip | tail -1 | awk '{print $2}')
-              echo "apex-ohlcv-${TF}.zip: $COUNT files"
+            files=(merged/*-${TF}-futures.feather)
+            if [ ${#files[@]} -eq 0 ]; then
+              echo "No feather files found for $TF" >&2
+              exit 1
             fi
+            zip -j "release_assets/apex-ohlcv-${TF}.zip" "${files[@]}"
+            COUNT=$(unzip -l "release_assets/apex-ohlcv-${TF}.zip" | tail -1 | awk '{print $2}')
+            echo "apex-ohlcv-${TF}.zip: $COUNT files"
           done
 
       - name: Generate manifest and release notes
         run: |
-          python collector/make_manifest.py --data-dir merged --out-dir release_assets
+          python collector/make_manifest.py \
+            --data-dir merged \
+            --out-dir release_assets \
+            --snapshot-date "${{ needs.setup.outputs.snapshot_tag }}" \
+            --base-snapshot "${{ needs.setup.outputs.base_snapshot }}"
 
-      - name: Delete old latest release
+      - name: Publish dated release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes --repo "${{ github.repository }}" 2>/dev/null || true
-          git push origin :refs/tags/latest 2>/dev/null || true
-
-      - name: Publish rolling latest release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BODY=$(cat release_assets/release_notes.md)
-          gh release create latest \
-            --title "Apex DEX Historical Data (latest)" \
-            --notes "$BODY" \
+          gh release create "${{ needs.setup.outputs.snapshot_tag }}" \
+            --title "Apex DEX Historical Data (${{ needs.setup.outputs.snapshot_tag }})" \
+            --notes-file release_assets/release_notes.md \
             --repo "${{ github.repository }}" \
             release_assets/apex-ohlcv-15m.zip \
             release_assets/apex-ohlcv-1h.zip \
