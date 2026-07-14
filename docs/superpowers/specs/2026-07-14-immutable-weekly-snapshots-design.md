@@ -11,10 +11,10 @@ release download.
 
 - Replace the rolling `latest` release with immutable UTC date tags in `YYYY-MM-DD`
   format.
-- Build each snapshot from the newest prior dated snapshot plus newly fetched live
-  Apex API candles.
-- Preserve prior data when the API returns no data for a pair or a shard fails to
-  fetch a pair.
+- Re-fetch Apex's entire available OHLCV history from `DATA_GENESIS` on every
+  weekly run for every active perpetual market and supported timeframe.
+- Use the newest prior dated snapshot only as a validation baseline; never use it
+  as the source of candles in a newly published snapshot.
 - Validate that every published feather file is sorted, timestamp-unique, and is
   not shorter than its baseline file.
 - Update the manifest, release notes, workflow documentation, and download
@@ -47,55 +47,51 @@ not only that week’s delta. There is no `latest` tag or mutable release.
 ## Data Flow
 
 1. The setup job determines the release tag once and exposes it to all jobs.
-2. Before matrix collection, the workflow identifies the newest existing release
-   whose tag exactly matches `YYYY-MM-DD`, ordered by release creation date. It
-   records that tag as `base_snapshot`; absence of one means bootstrap from Apex
-   history genesis.
-3. Each matrix job downloads and unpacks that baseline release’s ZIP for its
-   assigned timeframe. The job passes the unpacked directory to the collector as
-   `--prior-data-dir`.
-4. For every assigned pair, the collector loads the baseline feather if it exists.
-   It fetches candles beginning one candle before the baseline’s latest timestamp
-   to include the last potentially revised or previously open candle. It combines
-   baseline and fetched rows by UTC timestamp, with fetched data winning only for
-   the overlap, then writes the complete sorted result to its shard artifact.
-5. If a pair has baseline data but the fetch returns no rows or fails, the
-   collector writes the unchanged baseline file to its shard artifact and records
-   the condition as a warning. A pair without baseline data and without fetched
-   data is skipped.
+2. Before collection, the workflow identifies the newest existing release whose
+   tag exactly matches `YYYY-MM-DD`, ordered by release creation date. It records
+   that tag as `base_snapshot`; its assets are downloaded only for validation.
+3. Every matrix job invokes the collector without `--prior-data-dir`. For every
+   assigned pair, the collector requests the full time range from `DATA_GENESIS`
+   through the run's fixed UTC collection cutoff, using API windows no larger than
+   200 candles.
+4. The collector deduplicates by UTC timestamp, sorts ascending, and writes the
+   complete API-returned history to its shard artifact. It does not merge or copy
+   candle rows from a prior release.
+5. A fetch that returns no valid candles for an active pair is a collection
+   failure, not a reason to carry forward stale data. Any failed matrix job blocks
+   publication.
 6. The publish job downloads all shard artifacts, packages each complete timeframe
-   set, generates metadata, verifies invariants against the baseline, and creates
-   the new date-tagged release.
+   set, generates metadata, verifies coverage against the baseline when present,
+   and creates the new date-tagged release.
 
 ## Collector Contract
 
-`--prior-data-dir` is a read-only baseline. The collector always writes outputs to
-`--out-dir`; it never relies on matching output paths already existing. For a pair
-with a baseline file, the collector must load that exact file from
-`prior_data_dir / out_path.name` before collecting.
+Each scheduled collection uses a single UTC cutoff timestamp established before
+the matrix starts. The collector always writes outputs to `--out-dir` and makes no
+use of `--prior-data-dir` during the scheduled full-history workflow.
 
 The initial request timestamp is:
 
-`max(DATA_GENESIS, latest_baseline_timestamp - candle_duration)`
+`DATA_GENESIS`
 
-This intentional one-candle overlap provides a bounded correction window without
-rewriting earlier history. After concatenation, duplicates are resolved by UTC
-timestamp with the fetched row taking precedence, then rows are sorted ascending.
+The final request ends at the fixed collection cutoff. The collector de-duplicates
+raw API rows by UTC timestamp and sorts the complete result ascending.
 
-The output must satisfy these invariants for any pair with a baseline:
+The output must satisfy these invariants:
 
-- Its first timestamp equals the baseline first timestamp.
-- Its final timestamp is greater than or equal to the baseline final timestamp.
 - It has no duplicate timestamps and timestamps are strictly ascending.
-- It includes every baseline timestamp except timestamps in the one-candle overlap
-  that are intentionally replaced by fetched values.
+- It contains data only fetched from the live Apex API during the current run.
+- When a baseline file exists for the same pair and timeframe, its first timestamp
+  is no later than the baseline first timestamp and its final timestamp is no
+  earlier than the baseline final timestamp.
 
 ## Publication Validation and Metadata
 
 The publish job downloads the selected baseline into a separate directory for
 validation. Before creating a release, a validation command compares every
 baseline feather to its candidate feather and fails if the candidate omits a
-baseline file, starts later, ends earlier, or has unsorted/duplicate timestamps.
+baseline file for an active pair, starts later, ends earlier, or has
+unsorted/duplicate timestamps.
 The validator also fails when no output exists for any configured timeframe.
 
 `manifest.json` gains `snapshot_date` and `base_snapshot` fields. Per-file
@@ -105,22 +101,23 @@ and that the release is immutable and contains full cumulative history.
 
 ## Failure Handling
 
-- No existing dated release: bootstrap by fetching full history from `DATA_GENESIS`.
-- Baseline download missing one timeframe ZIP: fail the workflow rather than
-  silently constructing a partial history.
-- Apex request failure: retry rate-limit failures as now; for other API failures,
-  retain that pair’s baseline and emit a warning. Bootstrap pairs with no baseline
-  remain absent and must be reported in the manifest/release notes.
+- No existing dated release: collect and publish the full live API history from
+  `DATA_GENESIS`.
+- Baseline download missing one timeframe ZIP: fail validation rather than
+  silently publishing a snapshot whose continuity cannot be checked.
+- Apex request failure or an active pair with no valid fetched candles: retry
+  rate-limit failures as now, then fail the matrix job. Do not copy prior data
+  into a current live-API snapshot.
 - Existing target tag: fail without changing any release.
 - Validation failure: fail before `gh release create`; all historical releases
   remain untouched.
 
 ## Testing
 
-Unit tests will cover baseline path loading, one-candle overlap selection,
-baseline-plus-delta merging, no-data fallback, and preservation invariants. Tests
-will use generated feather fixtures and mocked Apex responses; no live network
-requests are required.
+Unit tests will cover full-history request boundaries, fixed collection cutoff,
+window pagination, duplicate removal, empty-response failure, and output
+invariants. Tests will use mocked Apex responses; no live network requests are
+required.
 
 Workflow-oriented tests will exercise tag selection from mocked GitHub CLI JSON,
 reject duplicate target tags, reject a missing baseline asset, and verify the
