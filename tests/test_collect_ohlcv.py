@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from collector.collect_ohlcv import _rows_to_df, fetch_ohlcv
+from collector.collect_ohlcv import _rows_to_df, fetch_ohlcv, select_active_swap_pairs
 
 
 class Exchange:
@@ -50,3 +50,13 @@ def test_rows_to_df_deduplicates_and_sorts_by_date():
     ]
     assert len(df) == 2
     assert df.iloc[-1][["open", "high", "low", "close", "volume"]].tolist() == [3.0, 3.0, 3.0, 3.0, 3.0]
+
+
+def test_select_active_swap_pairs_excludes_inactive_swaps():
+    markets = {
+        "BTC/USDT:USDT": {"type": "swap", "active": True},
+        "APE/USDT:USDT": {"type": "swap", "active": False},
+        "ETH/USDT": {"type": "spot", "active": True},
+    }
+
+    assert select_active_swap_pairs(markets) == ["BTC/USDT:USDT"]

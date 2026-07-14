@@ -78,6 +78,15 @@ def _feather_path(out_dir: Path, pair: str, timeframe: str) -> Path:
     return out_dir / f"{stem}-{timeframe}-futures.feather"
 
 
+def select_active_swap_pairs(markets: dict[str, dict]) -> list[str]:
+    """Return only currently active perpetual swap markets."""
+    return sorted(
+        symbol
+        for symbol, market in markets.items()
+        if market.get("type") == "swap" and market.get("active") is True
+    )
+
+
 def _rows_to_df(rows: list[dict]) -> pd.DataFrame:
     records = [
         {
@@ -191,7 +200,7 @@ def main() -> None:
     )
     logger.info("Loading Apex markets...")
     markets = exchange.load_markets()
-    all_pairs = sorted(sym for sym, m in markets.items() if m.get("type") == "swap")
+    all_pairs = select_active_swap_pairs(markets)
 
     # Deterministic strided sharding: shard 0 takes [0, N, 2N, ...], shard 1 takes [1, N+1, ...]
     pairs = all_pairs[args.shard :: args.total_shards]
