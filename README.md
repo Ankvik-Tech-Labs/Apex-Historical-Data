@@ -1,6 +1,6 @@
 # Apex DEX Historical Data
 
-Automated collector for Apex DEX (ApeX Omni) historical perpetual swap candles, published as a rolling GitHub Release every Sunday.
+Automated collector for Apex DEX (ApeX Omni) historical perpetual swap candles, published as immutable UTC date-tagged GitHub Releases every Sunday.
 
 ## Dataset
 
@@ -16,8 +16,12 @@ Automated collector for Apex DEX (ApeX Omni) historical perpetual swap candles, 
 ## Download
 
 ```bash
-# Latest 1h candles for all 135 pairs
-gh release download latest \
+# Find dated snapshots
+gh release list --repo Ankvik-Tech-Labs/Apex-Historical-Data --limit 100
+
+# Download a specific 1h snapshot for all 135 pairs
+SNAPSHOT=2026-07-14
+gh release download "$SNAPSHOT" \
   --pattern "apex-ohlcv-1h.zip" \
   --repo Ankvik-Tech-Labs/Apex-Historical-Data
 
@@ -25,9 +29,10 @@ unzip apex-ohlcv-1h.zip -d data/
 ```
 
 ```bash
-# All timeframes
+# All timeframes from one snapshot
+SNAPSHOT=2026-07-14
 for TF in 15m 1h 4h 1d; do
-  gh release download latest --pattern "apex-ohlcv-${TF}.zip" \
+  gh release download "$SNAPSHOT" --pattern "apex-ohlcv-${TF}.zip" \
     --repo Ankvik-Tech-Labs/Apex-Historical-Data
   unzip apex-ohlcv-${TF}.zip -d data/
 done
@@ -35,7 +40,7 @@ done
 
 ```bash
 # Via curl (no gh CLI needed)
-curl -L https://github.com/Ankvik-Tech-Labs/Apex-Historical-Data/releases/download/latest/apex-ohlcv-1d.zip \
+curl -L https://github.com/Ankvik-Tech-Labs/Apex-Historical-Data/releases/download/2026-07-14/apex-ohlcv-1d.zip \
   -o apex-ohlcv-1d.zip
 ```
 
@@ -61,16 +66,16 @@ unzip apex-ohlcv-1h.zip -d user_data/data/apex/futures/
 
 ```
 GitHub Actions (weekly)
-├── setup      — generates shard matrix from SHARD_MAP
+├── setup      — generates shard matrix, snapshot tag, and UTC cutoff
 ├── ohlcv      — parallel matrix jobs (8 total)
 │   ├── 15m × 4 shards   (most API calls)
 │   ├── 1h  × 2 shards
 │   ├── 4h  × 1 shard
 │   └── 1d  × 1 shard
-└── publish    — merge shards → zip per timeframe → rolling "latest" release
+└── publish    — validate full-history shards → zip per timeframe → immutable dated release
 ```
 
-Each job downloads the prior release for its timeframe and only fetches the delta (new candles since last run), keeping weekly update time low.
+Each weekly run fetches the full live Apex API history from `DATA_GENESIS` through one workflow-wide UTC cutoff. The publish step uses the previous dated snapshot only as a validation baseline; it never supplies candle rows for the new release.
 
 ### Apex API quirks
 
@@ -83,6 +88,8 @@ Every release includes `manifest.json` with machine-readable coverage per asset:
 ```json
 {
   "generated": "2026-06-10",
+  "snapshot_date": "2026-06-10",
+  "base_snapshot": "2026-06-03",
   "exchange": "apex",
   "assets": {
     "BTC_USDT_USDT": {
@@ -99,12 +106,9 @@ Every release includes `manifest.json` with machine-readable coverage per asset:
 ```bash
 pip install -r requirements.txt
 
-# Full download
-python collector/collect_ohlcv.py --timeframe 1h --out-dir data/
-
-# Incremental (pass previous data dir)
-python collector/collect_ohlcv.py --timeframe 1h --out-dir data/ --prior-data-dir data/
+# Full-history snapshot through "now" in UTC
+python collector/collect_ohlcv.py --timeframe 1h --until "$(date -u +%s)" --out-dir data/
 
 # Shard 0 of 4 (matches CI matrix)
-python collector/collect_ohlcv.py --timeframe 15m --shard 0 --total-shards 4 --out-dir data/
+python collector/collect_ohlcv.py --timeframe 15m --shard 0 --total-shards 4 --until "$(date -u +%s)" --out-dir data/
 ```

@@ -16,13 +16,10 @@ Apex API quirks handled here:
 Usage::
 
     # Full timeframe, all pairs
-    python collect_ohlcv.py --timeframe 1h
+    python collect_ohlcv.py --timeframe 1h --until 1718409600
 
     # Shard 0 of 4 (for CI matrix parallelism)
-    python collect_ohlcv.py --timeframe 15m --shard 0 --total-shards 4
-
-    # Incremental from a prior data dir
-    python collect_ohlcv.py --timeframe 1h --prior-data-dir /path/to/prev/feathers
+    python collect_ohlcv.py --timeframe 15m --shard 0 --total-shards 4 --until 1718409600
 """
 
 from __future__ import annotations
@@ -81,25 +78,6 @@ def _feather_path(out_dir: Path, pair: str, timeframe: str) -> Path:
     return out_dir / f"{stem}-{timeframe}-futures.feather"
 
 
-def _load_prior_latest_ts(prior_dir: Path, pair: str, timeframe: str) -> int | None:
-    """Return the latest timestamp (ms) in a prior feather file, or None."""
-    path = _feather_path(prior_dir, pair, timeframe)
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_feather(path)
-        if df.empty:
-            return None
-        col = df.columns[0]  # date is always first column
-        ts = df[col].iloc[-1]
-        if hasattr(ts, "timestamp"):
-            return int(ts.timestamp() * 1000)
-        return int(ts)
-    except Exception as exc:
-        logger.warning("Could not read prior feather %s: %s", path, exc)
-        return None
-
-
 def _rows_to_df(rows: list[dict]) -> pd.DataFrame:
     records = [
         {
@@ -135,23 +113,24 @@ def fetch_ohlcv(
     apex_interval: str,
     candle_secs: int,
     since_s: int,
+    until_s: int,
 ) -> list[dict]:
-    """Fetch all candles from ``since_s`` to now using windowed start+end calls.
+    """Fetch all candles from ``since_s`` to ``until_s`` using windowed start+end calls.
 
     :param exchange: CCXT apex instance.
     :param api_sym: API symbol string e.g. ``BTCUSDT``.
     :param apex_interval: Apex interval code e.g. ``60`` or ``D``.
     :param candle_secs: Candle duration in seconds.
     :param since_s: Start timestamp in UNIX seconds (inclusive).
+    :param until_s: End timestamp in UNIX seconds (inclusive).
     :returns: List of raw candle dicts ``{t, o, h, l, c, v}``.
     """
     all_rows: list[dict] = []
     window_secs = API_MAX * candle_secs
-    now_s = int(pd.Timestamp("now", tz="UTC").timestamp())
     start_s = since_s
 
-    while start_s < now_s:
-        end_s = min(start_s + window_secs, now_s)
+    while start_s <= until_s:
+        end_s = min(start_s + window_secs, until_s)
         try:
             raw = exchange.publicGetV3Klines(
                 {
@@ -168,8 +147,7 @@ def fetch_ohlcv(
             continue
         except ccxt.BaseError as exc:
             logger.warning("API error %s %s: %s", api_sym, apex_interval, exc)
-            start_s = end_s + 1
-            continue
+            raise
 
         batch = raw.get("data", {}).get(api_sym, [])
         if batch:
@@ -188,10 +166,10 @@ def fetch_ohlcv(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Apex DEX OHLCV collector")
     ap.add_argument("--timeframe", required=True, choices=list(TF_MAP), help="Candle timeframe")
+    ap.add_argument("--until", type=int, required=True, help="UTC UNIX seconds cutoff to fetch through")
     ap.add_argument("--shard", type=int, default=0, help="Shard index (0-based)")
     ap.add_argument("--total-shards", type=int, default=1, help="Total number of shards")
     ap.add_argument("--out-dir", type=Path, default=Path("data"), help="Output directory for feathers")
-    ap.add_argument("--prior-data-dir", type=Path, default=None, help="Dir with prior feathers for incremental update")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -202,6 +180,8 @@ def main() -> None:
 
     apex_interval, candle_secs = TF_MAP[args.timeframe]
     genesis_s = int(pd.Timestamp(DATA_GENESIS, tz="UTC").timestamp())
+    if args.until < genesis_s:
+        ap.error(f"--until must be >= DATA_GENESIS ({DATA_GENESIS})")
 
     exchange = ccxt.apex(
         {
@@ -224,48 +204,26 @@ def main() -> None:
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    saved = skipped = 0
+    saved = 0
 
     for i, pair in enumerate(pairs, 1):
         m = markets[pair]
         api_sym = _api_symbol(m)
         out_path = _feather_path(args.out_dir, pair, args.timeframe)
 
-        # Incremental: if we have prior data, start from its latest timestamp + 1 candle
-        since_s = genesis_s
-        if args.prior_data_dir:
-            latest_ms = _load_prior_latest_ts(args.prior_data_dir, pair, args.timeframe)
-            if latest_ms is not None:
-                since_s = int(latest_ms / 1000) + candle_secs
-
         logger.info(
-            "[%d/%d] %s %s since=%s",
+            "[%d/%d] %s %s since=%s until=%s",
             i, len(pairs), pair, args.timeframe,
-            pd.Timestamp(since_s, unit="s", tz="UTC").date(),
+            pd.Timestamp(genesis_s, unit="s", tz="UTC").date(),
+            pd.Timestamp(args.until, unit="s", tz="UTC").date(),
         )
 
-        rows = fetch_ohlcv(exchange, api_sym, apex_interval, candle_secs, since_s)
+        rows = fetch_ohlcv(exchange, api_sym, apex_interval, candle_secs, genesis_s, args.until)
 
         if not rows:
-            logger.warning("  No data — skipping")
-            skipped += 1
-            continue
+            raise RuntimeError(f"No data returned for active market {pair} {args.timeframe}")
 
         new_df = _rows_to_df(rows)
-
-        # Merge with prior data if doing incremental update
-        if args.prior_data_dir and out_path.exists():
-            try:
-                prior_df = pd.read_feather(args.prior_data_dir / out_path.name)
-                prior_df.columns = FREQTRADE_COLS
-                prior_df["date"] = pd.to_datetime(prior_df["date"], utc=True)
-                combined = pd.concat([prior_df, new_df], ignore_index=True)
-                combined.drop_duplicates(subset=["date"], keep="last", inplace=True)
-                combined.sort_values("date", inplace=True)
-                combined.reset_index(drop=True, inplace=True)
-                new_df = combined
-            except Exception as exc:
-                logger.warning("Could not merge prior data for %s: %s — using new only", pair, exc)
 
         _save_feather(new_df, out_path)
         logger.info(
@@ -276,7 +234,7 @@ def main() -> None:
         )
         saved += 1
 
-    logger.info("Done. saved=%d skipped=%d", saved, skipped)
+    logger.info("Done. saved=%d", saved)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", type=Path, default=Path("data"))
     ap.add_argument("--out-dir", type=Path, default=Path("."))
+    ap.add_argument("--snapshot-date", required=True)
+    ap.add_argument("--base-snapshot", default=None)
     args = ap.parse_args()
+
+    snapshot_date = str(pd.Timestamp(args.snapshot_date, tz="UTC").date())
+    if snapshot_date != args.snapshot_date:
+        raise SystemExit("--snapshot-date must be normalized YYYY-MM-DD")
+
+    base_snapshot = args.base_snapshot or None
+    if base_snapshot is not None:
+        normalized_base = str(pd.Timestamp(base_snapshot, tz="UTC").date())
+        if normalized_base != base_snapshot:
+            raise SystemExit("--base-snapshot must be normalized YYYY-MM-DD")
+        base_snapshot = normalized_base
 
     feathers = sorted(args.data_dir.glob("*-futures.feather"))
     if not feathers:
@@ -69,11 +82,14 @@ def main() -> None:
 
     manifest = {
         "generated": str(pd.Timestamp("now", tz="UTC").date()),
+        "snapshot_date": snapshot_date,
+        "base_snapshot": base_snapshot,
         "exchange": "apex",
         "assets": dict(sorted(assets.items())),
     }
 
     out_manifest = args.out_dir / "manifest.json"
+    out_manifest.parent.mkdir(parents=True, exist_ok=True)
     out_manifest.write_text(json.dumps(manifest, indent=2))
     print(f"Wrote {out_manifest}")
 
@@ -81,9 +97,13 @@ def main() -> None:
     lines = [
         "# Apex DEX Historical Data",
         "",
-        f"**Updated:** {manifest['generated']}  ",
-        f"**Assets:** {len(assets)}  ",
-        f"**Files:** {len(feathers)}",
+        f"Snapshot: {snapshot_date}  ",
+        f"Base snapshot: {base_snapshot or 'none'}  ",
+        f"Updated: {manifest['generated']}  ",
+        f"Assets: {len(assets)}  ",
+        f"Files: {len(feathers)}",
+        "",
+        "This release is an immutable snapshot of the full live Apex API history.",
         "",
         "## Coverage",
         "",
