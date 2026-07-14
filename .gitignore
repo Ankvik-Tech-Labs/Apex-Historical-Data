@@ -5,3 +5,4 @@ release_assets/
 __pycache__/
 *.pyc
 .env
+.worktrees/
