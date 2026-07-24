@@ -58,6 +58,39 @@ TF_MAP: dict[str, tuple[str, int]] = {
 
 FREQTRADE_COLS = ["date", "open", "high", "low", "close", "volume"]
 
+# Transient failures worth retrying before giving up on a single request.
+RETRYABLE_ERRORS = (
+    ccxt.RequestTimeout,
+    ccxt.NetworkError,
+    ccxt.ExchangeNotAvailable,
+    ccxt.DDoSProtection,
+    ccxt.RateLimitExceeded,
+)
+MAX_RETRIES = 6
+
+
+def _with_retries(call, desc: str):
+    """Run ``call``, retrying transient network / rate errors with backoff.
+
+    :param call: Zero-arg callable performing one API request.
+    :param desc: Human-readable request description for log lines.
+    :returns: Whatever ``call`` returns on success.
+    :raises RuntimeError: if all :data:`MAX_RETRIES` attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return call()
+        except RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            wait = min(2 ** attempt, 30)
+            logger.warning(
+                "%s: %s (attempt %d/%d) — retrying in %ds",
+                desc, type(exc).__name__, attempt, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"{desc}: exhausted {MAX_RETRIES} retries") from last_exc
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,23 +173,18 @@ def fetch_ohlcv(
 
     while start_s <= until_s:
         end_s = min(start_s + window_secs, until_s)
-        try:
-            raw = exchange.publicGetV3Klines(
+        raw = _with_retries(
+            lambda s=start_s, e=end_s: exchange.publicGetV3Klines(
                 {
                     "symbol": api_sym,
                     "interval": apex_interval,
-                    "start": str(start_s),
-                    "end": str(end_s),
+                    "start": str(s),
+                    "end": str(e),
                     "limit": str(API_MAX),
                 }
-            )
-        except ccxt.RateLimitExceeded:
-            logger.warning("Rate limited on %s %s — sleeping 10s", api_sym, apex_interval)
-            time.sleep(10)
-            continue
-        except ccxt.BaseError as exc:
-            logger.warning("API error %s %s: %s", api_sym, apex_interval, exc)
-            raise
+            ),
+            f"{api_sym} {apex_interval} klines @ {start_s}",
+        )
 
         batch = raw.get("data", {}).get(api_sym, [])
         if batch:
@@ -214,6 +242,7 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
+    failed: list[str] = []
 
     for i, pair in enumerate(pairs, 1):
         m = markets[pair]
@@ -227,23 +256,31 @@ def main() -> None:
             pd.Timestamp(args.until, unit="s", tz="UTC").date(),
         )
 
-        rows = fetch_ohlcv(exchange, api_sym, apex_interval, candle_secs, genesis_s, args.until)
+        try:
+            rows = fetch_ohlcv(exchange, api_sym, apex_interval, candle_secs, genesis_s, args.until)
+            if not rows:
+                raise RuntimeError("no candles returned")
+            new_df = _rows_to_df(rows)
+            _save_feather(new_df, out_path)
+            logger.info(
+                "  Saved %d candles (%s → %s)",
+                len(new_df),
+                new_df["date"].iloc[0].date(),
+                new_df["date"].iloc[-1].date(),
+            )
+            saved += 1
+        except Exception as exc:  # noqa: BLE001 — one bad pair must not kill the shard
+            logger.error("  FAILED %s %s: %s — skipping", pair, args.timeframe, exc)
+            failed.append(pair)
 
-        if not rows:
-            raise RuntimeError(f"No data returned for active market {pair} {args.timeframe}")
+    logger.info("Done. saved=%d failed=%d", saved, len(failed))
+    if failed:
+        logger.warning("Failed pairs (%d): %s", len(failed), ", ".join(failed))
 
-        new_df = _rows_to_df(rows)
-
-        _save_feather(new_df, out_path)
-        logger.info(
-            "  Saved %d candles (%s → %s)",
-            len(new_df),
-            new_df["date"].iloc[0].date(),
-            new_df["date"].iloc[-1].date(),
-        )
-        saved += 1
-
-    logger.info("Done. saved=%d", saved)
+    # Tolerate a handful of transient per-pair failures; abort the shard only on
+    # a systemic problem (>20% of the shard, or nothing saved at all).
+    if not saved or len(failed) > max(1, len(pairs) // 5):
+        raise SystemExit(f"{len(failed)}/{len(pairs)} pairs failed — aborting shard")
 
 
 if __name__ == "__main__":
