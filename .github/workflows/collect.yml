@@ -16,6 +16,8 @@ permissions:
 #   1d  — 1 shard
 env:
   SHARD_MAP: '{"15m":4,"1h":2,"4h":1,"1d":1}'
+  # Funding is hourly, ~100 rows/window — cheap; 2 shards is plenty.
+  FUNDING_SHARDS: 2
 
 jobs:
   # -------------------------------------------------------------------------
@@ -25,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+      funding_matrix: ${{ steps.gen.outputs.funding_matrix }}
       snapshot_tag: ${{ steps.gen.outputs.snapshot_tag }}
       collection_cutoff: ${{ steps.gen.outputs.collection_cutoff }}
       base_snapshot: ${{ steps.gen.outputs.base_snapshot }}
@@ -50,12 +53,15 @@ jobs:
               for i in range(n):
                   items.append({"timeframe": tf, "shard": i, "total_shards": n})
           matrix = json.dumps({"include": items})
+          n_fund = int(os.environ["FUNDING_SHARDS"])
+          funding = json.dumps({"include": [{"shard": i, "total_shards": n_fund} for i in range(n_fund)]})
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={matrix}\n")
+              f.write(f"funding_matrix={funding}\n")
               f.write(f"snapshot_tag={os.environ['SNAPSHOT_TAG']}\n")
               f.write(f"collection_cutoff={os.environ['COLLECTION_CUTOFF']}\n")
               f.write(f"base_snapshot={os.environ.get('BASE_SNAPSHOT', '')}\n")
-          print(f"Matrix: {len(items)} jobs")
+          print(f"Matrix: {len(items)} ohlcv jobs, {n_fund} funding jobs")
           EOF
 
   # -------------------------------------------------------------------------
@@ -97,10 +103,47 @@ jobs:
           retention-days: 1
 
   # -------------------------------------------------------------------------
+  # 2b. Collect funding rates — parallel matrix
+  # -------------------------------------------------------------------------
+  funding:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.funding_matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect funding rates
+        run: |
+          python collector/collect_funding.py \
+            --shard ${{ matrix.shard }} \
+            --total-shards ${{ matrix.total_shards }} \
+            --out-dir data/ \
+            --until ${{ needs.setup.outputs.collection_cutoff }}
+
+      - name: Upload funding shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: funding-shard${{ matrix.shard }}
+          path: data/
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
   # 3. Merge shards, generate manifest, publish release
   # -------------------------------------------------------------------------
   publish:
-    needs: [setup, ohlcv]
+    needs: [setup, ohlcv, funding]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -121,6 +164,13 @@ jobs:
         with:
           pattern: ohlcv-*
           path: merged/
+          merge-multiple: true
+
+      - name: Download funding shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: funding-*
+          path: merged_funding/
           merge-multiple: true
 
       - name: Download baseline release
@@ -167,6 +217,18 @@ jobs:
             echo "apex-ohlcv-${TF}.zip: $COUNT files"
           done
 
+      - name: Package funding zip
+        run: |
+          shopt -s nullglob
+          files=(merged_funding/*-1h-funding_rate.feather)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No funding feather files found" >&2
+            exit 1
+          fi
+          zip -j "release_assets/apex-funding.zip" "${files[@]}"
+          COUNT=$(unzip -l "release_assets/apex-funding.zip" | tail -1 | awk '{print $2}')
+          echo "apex-funding.zip: $COUNT files"
+
       - name: Generate manifest and release notes
         run: |
           python collector/make_manifest.py \
@@ -187,5 +249,6 @@ jobs:
             release_assets/apex-ohlcv-1h.zip \
             release_assets/apex-ohlcv-4h.zip \
             release_assets/apex-ohlcv-1d.zip \
+            release_assets/apex-funding.zip \
             release_assets/manifest.json \
             release_assets/release_notes.md
