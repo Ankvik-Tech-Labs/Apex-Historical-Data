@@ -9,13 +9,12 @@ on:
 permissions:
   contents: read
 
-# Sharding strategy:
-#   15m — 4 shards (most API calls: ~260 windows/pair × 135 pairs)
-#   1h  — 2 shards
-#   4h  — 1 shard
-#   1d  — 1 shard
+# Sharding strategy — finer timeframes need more shards (more API windows):
+#   1m — 8 · 5m — 4 · 15m — 4 · 30m — 2 · 1h — 2 · 2h/4h/6h/12h/1d/1w — 1 each
+# New timeframes have no baseline in older releases; the baseline download
+# skips any asset the previous snapshot lacks (full fetch for that timeframe).
 env:
-  SHARD_MAP: '{"15m":4,"1h":2,"4h":1,"1d":1}'
+  SHARD_MAP: '{"1m":8,"5m":4,"15m":4,"30m":2,"1h":2,"2h":1,"4h":1,"6h":1,"12h":1,"1d":1,"1w":1}'
   # Funding is hourly, ~100 rows/window — cheap; 2 shards is plenty.
   FUNDING_SHARDS: 2
 
@@ -179,15 +178,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p /tmp/baseline_zip baseline
-          for TF in 15m 1h 4h 1d; do
+          for TF in 1m 5m 15m 30m 1h 2h 4h 6h 12h 1d 1w; do
             ASSET="apex-ohlcv-${TF}.zip"
             gh release download "${{ needs.setup.outputs.base_snapshot }}" \
               --pattern "$ASSET" \
               --dir /tmp/baseline_zip \
-              --repo "${{ github.repository }}"
+              --repo "${{ github.repository }}" || true
             if [ ! -f "/tmp/baseline_zip/$ASSET" ]; then
-              echo "Missing baseline asset $ASSET" >&2
-              exit 1
+              echo "No baseline asset $ASSET (new timeframe / first run for it) — full fetch, skipping" >&2
+              continue
             fi
             unzip -q "/tmp/baseline_zip/$ASSET" -d baseline/
             rm -f "/tmp/baseline_zip/$ASSET"
@@ -206,7 +205,7 @@ jobs:
         run: |
           mkdir -p release_assets
           shopt -s nullglob
-          for TF in 15m 1h 4h 1d; do
+          for TF in 1m 5m 15m 30m 1h 2h 4h 6h 12h 1d 1w; do
             files=(merged/*-${TF}-futures.feather)
             if [ ${#files[@]} -eq 0 ]; then
               echo "No feather files found for $TF" >&2
@@ -245,10 +244,17 @@ jobs:
             --title "Apex DEX Historical Data (${{ needs.setup.outputs.snapshot_tag }})" \
             --notes-file release_assets/release_notes.md \
             --repo "${{ github.repository }}" \
+            release_assets/apex-ohlcv-1m.zip \
+            release_assets/apex-ohlcv-5m.zip \
             release_assets/apex-ohlcv-15m.zip \
+            release_assets/apex-ohlcv-30m.zip \
             release_assets/apex-ohlcv-1h.zip \
+            release_assets/apex-ohlcv-2h.zip \
             release_assets/apex-ohlcv-4h.zip \
+            release_assets/apex-ohlcv-6h.zip \
+            release_assets/apex-ohlcv-12h.zip \
             release_assets/apex-ohlcv-1d.zip \
+            release_assets/apex-ohlcv-1w.zip \
             release_assets/apex-funding.zip \
             release_assets/manifest.json \
             release_assets/release_notes.md
