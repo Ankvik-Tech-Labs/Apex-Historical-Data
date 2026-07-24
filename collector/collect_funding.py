@@ -50,6 +50,39 @@ FUNDING_TF = "1h"
 
 FREQTRADE_COLS = ["date", "open", "high", "low", "close", "volume"]
 
+# Transient failures worth retrying before giving up on a single request.
+RETRYABLE_ERRORS = (
+    ccxt.RequestTimeout,
+    ccxt.NetworkError,
+    ccxt.ExchangeNotAvailable,
+    ccxt.DDoSProtection,
+    ccxt.RateLimitExceeded,
+)
+MAX_RETRIES = 6
+
+
+def _with_retries(call, desc: str):
+    """Run ``call``, retrying transient network / rate errors with backoff.
+
+    :param call: Zero-arg callable performing one API request.
+    :param desc: Human-readable request description for log lines.
+    :returns: Whatever ``call`` returns on success.
+    :raises RuntimeError: if all :data:`MAX_RETRIES` attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return call()
+        except RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            wait = min(2 ** attempt, 30)
+            logger.warning(
+                "%s: %s (attempt %d/%d) — retrying in %ds",
+                desc, type(exc).__name__, attempt, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"{desc}: exhausted {MAX_RETRIES} retries") from last_exc
+
 
 # ---------------------------------------------------------------------------
 # Helpers (kept byte-identical to collect_ohlcv for cross-collector parity)
@@ -71,7 +104,11 @@ def _feather_path(out_dir: Path, pair: str) -> Path:
 
 
 def select_active_swap_pairs(markets: dict[str, dict]) -> list[str]:
-    """Return only currently active perpetual swap markets."""
+    """Return only currently active perpetual swap markets.
+
+    Delisted markets are intentionally excluded — there is no point archiving
+    funding for tokens that can no longer be traded / backtested.
+    """
     return sorted(
         symbol
         for symbol, market in markets.items()
@@ -129,20 +166,15 @@ def fetch_funding(
 
     while start_ms <= until_ms:
         end_ms = min(start_ms + window_ms, until_ms)
-        try:
-            batch = exchange.fetch_funding_rate_history(
+        batch = _with_retries(
+            lambda s=start_ms, e=end_ms: exchange.fetch_funding_rate_history(
                 symbol,
-                since=start_ms,
+                since=s,
                 limit=API_MAX,
-                params={"until": end_ms},
-            )
-        except ccxt.RateLimitExceeded:
-            logger.warning("Rate limited on %s funding — sleeping 10s", symbol)
-            time.sleep(10)
-            continue
-        except ccxt.BaseError as exc:
-            logger.warning("API error %s funding: %s", symbol, exc)
-            raise
+                params={"until": e},
+            ),
+            f"{symbol} funding @ {start_ms}",
+        )
 
         if batch:
             all_rows.extend(batch)
@@ -192,6 +224,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
     empty = 0
+    failed: list[str] = []
 
     for i, pair in enumerate(pairs, 1):
         out_path = _feather_path(args.out_dir, pair)
@@ -202,25 +235,34 @@ def main() -> None:
             pd.Timestamp(args.until, unit="s", tz="UTC").date(),
         )
 
-        rows = fetch_funding(exchange, pair, genesis_s * 1000, args.until * 1000)
-        new_df = _rows_to_df(rows)
+        try:
+            rows = fetch_funding(exchange, pair, genesis_s * 1000, args.until * 1000)
+            new_df = _rows_to_df(rows)
+            if new_df.empty:
+                # Not fatal: some markets are too new or expose no funding history.
+                logger.warning("  No funding for %s — skipping", pair)
+                empty += 1
+                continue
+            _save_feather(new_df, out_path)
+            logger.info(
+                "  Saved %d funding rows (%s → %s)",
+                len(new_df),
+                new_df["date"].iloc[0].date(),
+                new_df["date"].iloc[-1].date(),
+            )
+            saved += 1
+        except Exception as exc:  # noqa: BLE001 — one bad pair must not kill the shard
+            logger.error("  FAILED %s funding: %s — skipping", pair, exc)
+            failed.append(pair)
 
-        if new_df.empty:
-            # Not fatal: some markets are too new or expose no funding history.
-            logger.warning("  No funding for %s — skipping", pair)
-            empty += 1
-            continue
+    logger.info("Done. saved=%d empty=%d failed=%d", saved, empty, len(failed))
+    if failed:
+        logger.warning("Failed pairs (%d): %s", len(failed), ", ".join(failed))
 
-        _save_feather(new_df, out_path)
-        logger.info(
-            "  Saved %d funding rows (%s → %s)",
-            len(new_df),
-            new_df["date"].iloc[0].date(),
-            new_df["date"].iloc[-1].date(),
-        )
-        saved += 1
-
-    logger.info("Done. saved=%d empty=%d", saved, empty)
+    # An empty funding series is expected for some markets, so only a large
+    # fraction of hard *failures* (>20% of the shard) aborts the run.
+    if pairs and len(failed) > max(1, len(pairs) // 5):
+        raise SystemExit(f"{len(failed)}/{len(pairs)} pairs failed — aborting shard")
 
 
 if __name__ == "__main__":
